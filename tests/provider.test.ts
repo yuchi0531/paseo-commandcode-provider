@@ -832,6 +832,135 @@ describe("commandcode provider", () => {
     await connection.close();
   });
 
+  it("steers an active turn by interrupting and resuming over the native session", async () => {
+    const spawned: string[][] = [];
+    const procs: Array<{
+      stdout: ReturnType<typeof stream>;
+      stderr: ReturnType<typeof stream>;
+      procEvents: ReturnType<typeof stream>;
+      kill: () => void;
+    }> = [];
+    const fakeSpawn: SpawnFn = () => {
+      const stdout = stream();
+      const stderr = stream();
+      const procEvents = stream();
+      const index = procs.length;
+      const proc = {
+        stdout,
+        stderr,
+        procEvents,
+        on: procEvents.on,
+        kill: () => {
+          if (index === 0) procs[0].procEvents.emit("close", null);
+        },
+      };
+      procs.push(proc);
+      spawned.push([]);
+      // SpawnFn is (command, args, options) => Proc; capture args via closure below.
+      return proc as unknown as Proc;
+    };
+    // Capture args by wrapping: SpawnFn signature lets us read args directly.
+    const capturingSpawn: SpawnFn = (cmd, args) => {
+      const proc = fakeSpawn(cmd, args, { cwd: "/tmp", env: {} });
+      spawned[spawned.length - 1] = args;
+      return proc;
+    };
+    const connection = await createCommandcodeProvider({
+      spawn: capturingSpawn,
+      listModels: () => Promise.resolve("fallback-model  fallback (default)"),
+      log: () => {},
+    }).connect({
+      versions: [1],
+      capabilities: ["prompt.message", "prompt.command", "prompt.steer", "session.configure", "session.persistence"],
+    });
+    const events: ProviderEvent[] = [];
+    connection.onEvent((event) => events.push(event));
+
+    await connection.send({ type: "session.open", requestId: "o1", sessionId: "s1", config: { cwd: "/tmp", env: {}, mcpServers: {}, settings: {}, persist: false }, history: "skip" });
+    await tick();
+    await connection.send({
+      type: "session.prompt",
+      sessionId: "s1",
+      prompt: { clientMessageId: "m1", delivery: "auto", input: { type: "message", content: [{ type: "text", text: "hello" }] } },
+    });
+    await tick();
+    expect(spawned[0]).toContain("hello");
+    procs[0].stdout.emit("data", '{"type":"event","event":{"type":"run_start","sessionId":"native-1"}}\n{"type":"event","event":{"type":"text_delta","delta":"partial"}}\n');
+    await tick();
+
+    // Steer mid-turn.
+    await connection.send({
+      type: "session.prompt",
+      sessionId: "s1",
+      prompt: { clientMessageId: "s1", delivery: "steer", input: { type: "message", content: [{ type: "text", text: "continue here" }] } },
+    });
+    await tick();
+    await tick();
+
+    // The steer ack is emitted on the existing turn; the resumed proc reuses
+    // the native session id and carries the steered text.
+    const ack = events.find(
+      (event): event is Extract<ProviderEvent, { type: "session.prompt_result" }> =>
+        event.type === "session.prompt_result" && event.result.type === "steer",
+    );
+    expect(ack?.result.type).toBe("steer");
+    const turnId = ack?.result.type === "steer" ? ack.result.turnId : undefined;
+    expect(turnId).toBeTypeOf("string");
+    const steerUser = events.find(
+      (event): event is Extract<ProviderEvent, { type: "timeline.item" }> =>
+        event.type === "timeline.item" && event.item.type === "user_message" && event.item.id === `user-${turnId}-steer`,
+    );
+    expect(steerUser?.item.type === "user_message" ? steerUser.item.text : undefined).toBe("continue here");
+    expect(steerUser?.item.type === "user_message" ? steerUser.item.clientMessageId : undefined).toBe("s1");
+
+    expect(spawned[1]).toContain("--session");
+    expect(spawned[1]).toContain("native-1");
+    expect(spawned[1]).toContain("continue here");
+
+    // The resumed proc completes the SAME turn.
+    procs[1].stdout.emit("data", '{"type":"event","event":{"type":"text_delta","delta":"continued"}}\n{"type":"result","subtype":"success","sessionId":"native-1","finalText":"continued"}\n');
+    await tick();
+    await tick();
+    const done = events.find(
+      (event): event is Extract<ProviderEvent, { type: "session.turn" }> =>
+        event.type === "session.turn" && event.state === "completed" && event.turnId === turnId,
+    );
+    expect(done).toBeDefined();
+    await connection.close();
+  });
+
+  it("refuses a steer when no turn is active", async () => {
+    const connection = await createCommandcodeProvider({
+      spawn: () => {
+        throw new Error("no spawn");
+      },
+      listModels: () => Promise.resolve("fallback-model  fallback (default)"),
+      log: () => {},
+    }).connect({
+      versions: [1],
+      capabilities: ["prompt.message", "prompt.command", "prompt.steer"],
+    });
+    const events: ProviderEvent[] = [];
+    connection.onEvent((event) => events.push(event));
+    await connection.send({ type: "session.open", requestId: "o1", sessionId: "s1", config: { cwd: "/tmp", env: {}, mcpServers: {}, settings: {}, persist: false }, history: "skip" });
+    await tick();
+    await connection.send({
+      type: "session.prompt",
+      sessionId: "s1",
+      prompt: { clientMessageId: "s1", delivery: "steer", input: { type: "message", content: [{ type: "text", text: "ghost" }] } },
+    });
+    await tick();
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        type: "session.prompt_result",
+        clientMessageId: "s1",
+        result: { type: "failed", error: { message: "No active turn to steer" } },
+      }),
+    );
+    await connection.close();
+  });
+
+
   it("derives titles from the first prompt", () => {
     expect(makeTitle(undefined, "  fix the login bug\nplease  ")).toBe("fix the login bug please");
     expect(makeTitle("Custom", "anything")).toBe("Custom");

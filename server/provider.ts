@@ -26,6 +26,7 @@ import { CLI_DEFAULTS, cliSettings } from "../shared/settings.js";
 const CAPABILITIES = [
   "prompt.message",
   "prompt.command",
+  "prompt.steer",
   "session.configure",
   "session.list",
   "session.persistence",
@@ -93,6 +94,10 @@ interface Session {
   tasks: Map<string, { text: string; status: "pending" | "in_progress" | "completed"; activeForm?: string }>;
   /** First user text, used as the session title when the host didn't provide one. */
   titleFromPrompt?: string;
+  /** Steer payload staged while the active turn's proc is being killed. */
+  steerText?: string;
+  /** turnId whose proc is being replaced by a resumed steer run. */
+  steeringTurnId?: string;
 }
 
 interface ModelsCache {
@@ -117,6 +122,8 @@ interface ConnectionState {
   models: ModelInfo[];
   defaultModel?: string;
   modelsFetchedAt: number;
+  /** Wall-clock time before which a failed model refresh must not be retried. */
+  modelsRetryAt: number;
   cache: ModelsCache;
   /** Models known (via rejection probe) to accept no --effort flag. */
   noEffortModels: Set<string>;
@@ -134,6 +141,8 @@ interface HealthState {
 
 const HEALTH_TTL_MS = 5 * 60 * 1000;
 const MODELS_TTL_MS = 60 * 60 * 1000;
+/** Do not respawn a failing `--list-models` on every snapshot; back off instead. */
+const MODELS_FAILURE_RETRY_MS = 5 * 60 * 1000;
 const execFileAsync = promisify(nodeExecFile);
 
 async function runListModels(command: string): Promise<string> {
@@ -243,6 +252,7 @@ function createConnection(
     models: options.cache.models,
     defaultModel: options.cache.defaultModel,
     modelsFetchedAt: 0,
+    modelsRetryAt: 0,
     cache: options.cache,
     // ponytail: ModelsCache is shared across connections, so the Set itself
     // must be shared too — otherwise probes learned on one connection would
@@ -296,6 +306,7 @@ async function refreshModels(state: ConnectionState): Promise<boolean> {
     return false;
   }
   if (Date.now() - state.modelsFetchedAt < MODELS_TTL_MS) return false;
+  if (Date.now() < state.modelsRetryAt) return false;
   try {
     const { models, defaultId } = parseListModels(await state.listModels());
     if (models.length > 0) {
@@ -307,12 +318,14 @@ async function refreshModels(state: ConnectionState): Promise<boolean> {
       }
       state.modelsFetchedAt = Date.now();
       state.cache.fetchedAt = Date.now();
+      state.modelsRetryAt = 0;
       return true;
     }
     state.log(`list-models returned no models (binary: ${state.command})`);
   } catch (error) {
     state.log(`list-models failed (${state.command}): ${error instanceof Error ? error.message : String(error)}`);
   }
+  state.modelsRetryAt = Date.now() + MODELS_FAILURE_RETRY_MS;
   return false;
 }
 
@@ -555,7 +568,7 @@ function openSession(
     type: "session.opened",
     requestId: input.requestId,
     sessionId: input.sessionId,
-    capabilities: ["prompt.message", "prompt.command", "session.configure", "session.list", "session.persistence"],
+    capabilities: ["prompt.message", "prompt.command", "prompt.steer", "session.configure", "session.list", "session.persistence"],
     restoration: "core",
     ...(session.nativeSessionId || session.tasks.size > 0 ? { persistence: persistenceData(session) } : {}),
     title: input.config.title,
@@ -777,7 +790,7 @@ function promptSession(
     return;
   }
   if (input.prompt.delivery === "steer") {
-    fail("Steering is not supported; wait for the turn to finish");
+    handleSteer(input.sessionId, session, input.prompt.clientMessageId, input.prompt, state);
     return;
   }
   if (input.prompt.input.type === "command") {
@@ -847,11 +860,11 @@ function runSlashCommand(
   });
 }
 
-function runAgentTurn(
+function handleSteer(
   sessionId: string,
   session: Session,
   clientMessageId: string,
-  text: string,
+  prompt: Extract<ProviderInput, { type: "session.prompt" }>["prompt"],
   state: ConnectionState,
 ): void {
   const fail = (message: string) => {
@@ -862,11 +875,52 @@ function runAgentTurn(
       result: { type: "failed", error: { message } },
     });
   };
-  if (session.active) {
-    fail("A turn is already running");
+  if (!session.active) {
+    fail("No active turn to steer");
     return;
   }
+  // ponytail: steer inputs are always message delivery (the host only offers
+  // the pill against a running message turn); slash/command steers don't exist.
+  const { text } = prompt.input.type === "message"
+    ? promptText(prompt.input.content)
+    : { text: "" };
+  if (!text.trim()) {
+    fail("Empty steer");
+    return;
+  }
+  const turnId = session.active.turnId;
+  const steerMessage = { type: "user_message" as const, id: `user-${turnId}-steer`, text, clientMessageId };
+  session.transcript.push(steerMessage);
+  state.emit({ type: "timeline.item", sessionId, item: steerMessage });
+  // ponytail: ack the steer on the existing turn so the host keeps the turn
+  // open while we swap the running proc for a resumed one.
+  state.emit({
+    type: "session.prompt_result",
+    sessionId,
+    clientMessageId,
+    result: { type: "steer", turnId },
+  });
+  session.steerText = text;
+  session.steeringTurnId = turnId;
+  session.active.proc.kill("SIGTERM");
+}
 
+function runAgentTurn(
+  sessionId: string,
+  session: Session,
+  clientMessageId: string,
+  text: string,
+  state: ConnectionState,
+): void {
+  if (session.active) {
+    state.emit({
+      type: "session.prompt_result",
+      sessionId,
+      clientMessageId,
+      result: { type: "failed", error: { message: "A turn is already running" } },
+    });
+    return;
+  }
   const turnId = randomUUID();
   const push = (item: ProviderTimelineItem) => {
     session.transcript.push(item);
@@ -899,7 +953,7 @@ function runAgentTurn(
       state.emit({
         type: "session.opened",
         sessionId,
-        capabilities: ["prompt.message", "prompt.command", "session.configure", "session.list", "session.persistence"],
+        capabilities: ["prompt.message", "prompt.command", "prompt.steer", "session.configure", "session.list", "session.persistence"],
         restoration: "core",
         persistence: persistenceData(session),
         title: session.titleFromPrompt || undefined,
@@ -920,16 +974,40 @@ function runAgentTurn(
     result: { type: "turn", turnId },
   });
   state.emit({ type: "session.turn", sessionId, turnId, state: "started" });
-
   const env: Record<string, string> = {};
   for (const [key, value] of Object.entries(process.env)) {
     if (value !== undefined) env[key] = value;
   }
   Object.assign(env, session.config.env);
+  streamTurn(turnId, sessionId, session, state, {
+    push,
+    emitTasks,
+    taskStatusOf,
+    env,
+    text,
+  });
+}
+
+// ponytail: streaming/spawn/finish machinery is shared between a brand-new
+// prompt and a steer-resumed continuation over the SAME turnId.
+function streamTurn(
+  turnId: string,
+  sessionId: string,
+  session: Session,
+  state: ConnectionState,
+  ctx: {
+    push: (item: ProviderTimelineItem) => void;
+    emitTasks: () => void;
+    taskStatusOf: (value: unknown) => "pending" | "in_progress" | "completed" | "deleted" | undefined;
+    env: Record<string, string>;
+    text: string;
+  },
+): void {
+  const { push, emitTasks, taskStatusOf, env } = ctx;
   const baseFlags = flagsFor(session, state);
   let attemptEffort = baseFlags.effort;
   let retriedWithoutEffort = false;
-  const spawnArgs = () => buildArgs({ ...baseFlags, effort: attemptEffort }, text);
+  const spawnArgs = () => buildArgs({ ...baseFlags, effort: attemptEffort }, ctx.text);
   let proc: Proc;
   try {
     proc = state.spawn(commandFor(session, state), spawnArgs(), {
@@ -938,6 +1016,7 @@ function runAgentTurn(
     });
   } catch (error) {
     state.log(`spawn failed (${commandFor(session, state)}): ${error instanceof Error ? error.message : String(error)}`);
+    push({ type: "error", id: `error-${turnId}`, message: friendlySpawnError(error, state) });
     state.emit({
       type: "session.turn",
       sessionId,
@@ -1178,13 +1257,34 @@ function runAgentTurn(
       finish(interrupted ? "canceled" : "failed", friendlySpawnError(message, state));
     });
     target.on("close", (code) => {
-      if (finished) return;
-      const interrupted = session.active?.interrupted;
-      if (interrupted) {
-        if (buffer.trim()) onChunk("\n");
-        finish("canceled");
-        return;
-      }
+     if (finished) return;
+     const interrupted = session.active?.interrupted;
+     // ponytail: a steer swapped the active proc for a resumed run over the
+     // same turnId — suppress this proc's terminal finish so the resumed
+     // streamTurn owns the lifecycle of the turn instead.
+     if (session.steeringTurnId === turnId) {
+       const steerText = session.steerText ?? "";
+       session.steeringTurnId = undefined;
+       session.steerText = undefined;
+       session.active = null;
+       if (buffer.trim()) onChunk("\n");
+       state.log(
+         `steer ${turnId}: resuming run over --session ${session.nativeSessionId ?? "(new)"} with new message`,
+       );
+       streamTurn(turnId, sessionId, session, state, {
+         push,
+         emitTasks,
+         taskStatusOf,
+         env,
+         text: steerText,
+       });
+       return;
+     }
+     if (interrupted) {
+       if (buffer.trim()) onChunk("\n");
+       finish("canceled");
+       return;
+     }
       if (buffer.trim()) onChunk("\n");
       if (typeof code === "number" && code !== 0) {
         // ponytail: --effort came from a stale per-agent Thinking value or a

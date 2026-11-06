@@ -52,7 +52,7 @@ Then create an agent with the **Command Code** provider.
 ## Known issues
 
 - Interactive/TTY-only features (`/usage`, `/login`, `/connect`, IDE setup) are unavailable headless — ask for them in the model prompt instead.
-- Images and steering are rejected with a clear error (the CLI has no image flag or live-turn channel; v2 may use the Provider API).
+- Steer is supported: a mid-turn steer interrupts the running headless process and resumes it over the same native session (`commandcode -p --session ...`) with the steered text, replaying into the existing turn rather than rejecting.
 - Effort levels are per-model (e.g. deepseek flash accepts only high/max) — the selector is omit-by-default so untouched sessions never error. Models probed as effortless (e.g. MiMo Flash rejects `--effort` at startup) get per-model `thinkingOptions: []` so the host hides the Thinking pill, stale pill values are stripped on model switch, and the turn is retried once without `--effort` instead of failing.
 
 ## Develop
